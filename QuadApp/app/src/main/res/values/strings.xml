@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">QuadApp</string>
+    <string name="title_activity_front_page">FrontPage</string>
+
+    <string name="hello_world">Hello world!</string>
+    <string name="action_settings">Settings</string>
+</resources>
