@@ -1,6 +1,4 @@
-#include <MPU6050_6Axis_MotionApps20.h>
-#include <MPU6050.h>
-#include <helper_3dmath.h>
+#include "MPU6050.h"
 #include "Wire.h"
 #include "I2Cdev.h"
 #include <PID_v1.h>
@@ -17,6 +15,11 @@
 #define MAX_PID      100
 #define MIN_PID     -100
 
+#define LOOP_PERIOD  0.03
+#define GYRO_SCALE   131
+#define RAD_TO_DEG   57.29578
+#define M_PI         3.14159265358979323846
+
 // ESC Variables -------------------------------------------------------- |
 Servo m1;
 Servo m2;
@@ -26,23 +29,15 @@ Servo m4;
 // IMU / MPU Variables -------------------------------------------------- |
 MPU6050 mpu;
 
-bool     dmpReady = false;  // set true if DMP init was successful
-uint8_t  mpuIntStatus;   // holds actual interrupt status byte from MPU
-uint8_t  devStatus;      // return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;     // count of all bytes currently in FIFO
-uint8_t  fifoBuffer[64]; // FIFO storage buffer
+float startTime;
 
-// Motion / Orientation variables
-Quaternion q;           // [w, x, y, z]         quaternion container
-VectorFloat gravity;    // [x, y, z]            gravity vector
-float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+int16_t mx, my, mz;
 
-volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
-
-void dmpDataReady() {
-    mpuInterrupt = true;
-}
+float gxAngle=0, gyAngle=0, gzAngle=0;
+float axAngle=0, ayAngle=0, azAngle=0;
+float yaw = 0, pitch = 0, roll = 0;
 
 // PID ----------------------------------------------------------------- |
 float setYaw      = 0;
@@ -81,8 +76,7 @@ bool readPos = false;
 
 String message = "";
 
-// ----------------------------------------------------------------------- |
-// Setup ----------------------------------------------------------------- |
+// Setup =================================================================================|
 void setup()
 {
   // join I2C bus (I2Cdev library doesn't do this automatically)
@@ -98,37 +92,6 @@ void setup()
   // verify connection
   Serial.println(F("Testing device connections..."));
   Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
-
-  // load and configure the DMP
-  Serial.println(F("Initializing DMP..."));
-  devStatus = mpu.dmpInitialize();
-    
-  // make sure it worked (returns 0 if so)
-    if (devStatus == 0) {
-        // turn on the DMP, now that it's ready
-        Serial.println(F("Enabling DMP..."));
-        mpu.setDMPEnabled(true);
-
-        // enable Arduino interrupt detection
-        Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
-        attachInterrupt(0, dmpDataReady, RISING);
-        mpuIntStatus = mpu.getIntStatus();
-
-        // set our DMP Ready flag so the main loop() function knows it's okay to use it
-        Serial.println(F("DMP ready! Waiting for first interrupt..."));
-        dmpReady = true;
-
-        // get expected DMP packet size for later comparison
-        packetSize = mpu.dmpGetFIFOPacketSize();
-    } else {
-        // ERROR!
-        // 1 = initial memory load failed
-        // 2 = DMP configuration updates failed
-        // (if it's going to break, usually the code will be 1)
-        Serial.print(F("DMP Initialization failed (code "));
-        Serial.print(devStatus);
-        Serial.println(F(")"));
-    }
   
   m1.attach(ESC_PIN_1);
   m2.attach(ESC_PIN_2);
@@ -144,47 +107,48 @@ void setup()
   rollPID.SetOutputLimits(MIN_PID, MAX_PID);
 }
 
-// ----------------------------------------------------------------------- |
-// Loop ------------------------------------------------------------------ |
+// Loop ==================================================================================|
 void loop()
 {
-    // Receive MPU data -------------------------------------------------- |
-    // wait for MPU interrupt or extra packet(s) available
-    while (!mpuInterrupt && fifoCount < packetSize) { }
+    startTime = millis();
+    
+    // Receive MPU data ------------------------------------------------------------------|
+    // Read raw accel/gyro measurements from device; IMU is sideways, so swap x and z
+    mpu.getMotion9(&az, &ay, &ax, &gz, &gy, &gx, &mz, &my, &mx);
 
-    // reset interrupt flag and get INT_STATUS byte
-    mpuInterrupt = false;
-    mpuIntStatus = mpu.getIntStatus();
+    // gyro sensitivity scale factor for 250 dps : 0.131
+    gx = (float) gx / GYRO_SCALE;
+    gy = (float) gy / GYRO_SCALE;
+    gz = (float) gz / GYRO_SCALE;
+    
+    // invert x due to orientation
+    gx = -gx;
+    
+    // calculate gyro angles using angular rotation rate and period between samples
+    gxAngle += gx * LOOP_PERIOD;
+    gyAngle += gy * LOOP_PERIOD;
+    gzAngle += gz * LOOP_PERIOD;
 
-    // get current FIFO count
-    fifoCount = mpu.getFIFOCount();
+    // convert accelerometer samples to angles in degrees
+    axAngle = (float)(atan2(ay,az) + M_PI) * RAD_TO_DEG;
+    ayAngle = (float)(atan2(ax,az) + M_PI) * RAD_TO_DEG;
+    azAngle = (float)(atan2(ax,ay) + M_PI) * RAD_TO_DEG;
 
-    // check for overflow (this should never happen unless our code is too inefficient)
-    if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-        // reset so we can continue cleanly
-        mpu.resetFIFO();
-        Serial.println();
-        Serial.println(F("FIFO overflow!"));
+    //change rotation val of accelerometer to +/- 180
+    if (axAngle > 180) axAngle -= 360;
+    if (ayAngle > 180) ayAngle -= 360;
+    if (azAngle > 180) azAngle -= 360;
 
-    // otherwise, check for DMP data ready interrupt (this should happen frequently)
-    } else if (mpuIntStatus & 0x01) {
-        // wait for correct available data length, should be a VERY short wait
-        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+    // filter and combine gyro and accel angles
+    yaw   = 0.98 * (yaw   + gz * LOOP_PERIOD) + (1 - 0.98) * azAngle;
+    pitch = 0.98 * (pitch + gx * LOOP_PERIOD) + (1 - 0.98) * axAngle;
+    roll  = 0.98 * (roll  + gy * LOOP_PERIOD) + (1 - 0.98) * ayAngle;
 
-        // read a packet from FIFO
-        mpu.getFIFOBytes(fifoBuffer, packetSize);
-        
-        // track FIFO count here in case there is > 1 packet available
-        // (this lets us immediately read more without waiting for an interrupt)
-        fifoCount -= packetSize;
+    //Serial.print(yaw); Serial.print("\t");
+    //Serial.print(pitch); Serial.print("\t");
+    //Serial.print(roll); Serial.print("\t\t\t");
 
-        // Delegate Yaw / Pitch / Roll calculation to DMP
-        mpu.dmpGetQuaternion(&q, fifoBuffer);
-        mpu.dmpGetGravity(&gravity, &q);
-        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-    }
-
-    // Receive user control data via bluetooth --------------------------- |
+    // Receive user control data via bluetooth -------------------------------------------|
     //Read from bluetooth and write to usb serial
     if(Serial.available())
     {
@@ -226,35 +190,46 @@ void loop()
     }
 
     // Set current orientation and position
-    inputYaw   = ypr[0] * 180/M_PI + yawOffset;
-    inputPitch = ypr[1] * 180/M_PI + pitchOffset;
-    inputRoll  = ypr[2] * 180/M_PI + rollOffset;
+    //inputYaw   = ypr[0] * 180/M_PI + yawOffset;
+    inputPitch  = pitch * 180/M_PI + pitchOffset;
+    inputRoll = roll * 180/M_PI + rollOffset;
+    
   
     yawPID.Compute();
     pitchPID.Compute();
     rollPID.Compute();
   
-    m1Throttle = throttle + pidOutRoll + pidOutPitch + pidOutYaw;
-    m2Throttle = throttle - pidOutRoll + pidOutPitch - pidOutYaw;
-    m3Throttle = throttle + pidOutRoll - pidOutPitch - pidOutYaw;
-    m4Throttle = throttle - pidOutRoll - pidOutPitch + pidOutYaw;
+    m1Throttle = throttle + pidOutRoll - pidOutPitch; // + pidOutYaw;
+    m2Throttle = throttle - pidOutRoll - pidOutPitch; // - pidOutYaw;
+    m3Throttle = throttle + pidOutRoll + pidOutPitch; // - pidOutYaw;
+    m4Throttle = throttle - pidOutRoll + pidOutPitch; // + pidOutYaw;
   
-    Serial.print("OutYaw : ");
-    Serial.print((float)inputYaw,3);
-    Serial.print("\t");
-    Serial.print("OutPitch : ");
-    Serial.print((float)inputPitch,3);
-    Serial.print("\t");
-    Serial.print("RollPID : ");
-    Serial.print((float)inputRoll,3);
-    Serial.print("\t");
-    Serial.print((float)m1Throttle,3);
-    Serial.print("\t");
-    Serial.print((float)m2Throttle,3);
-    Serial.print("\t");
-    Serial.print((float)m3Throttle,3);
-    Serial.print("\t");
-    Serial.println((float)m4Throttle,3);
+    //Serial.print("OutYaw : ");
+    //Serial.print((float)inputYaw,3);
+    //Serial.print("\t");
+    //Serial.print("OutPitch : ");
+    //Serial.print((float)inputPitch,3);
+    //Serial.print("\t");
+    //Serial.print("RollPID : ");
+    //Serial.print((float)inputRoll,3);
+    //Serial.print("\t");
+    //Serial.print((float)m1Throttle,3);
+    //Serial.print("\t");
+    //Serial.print((float)m2Throttle,3);
+    //Serial.print("\t");
+    //Serial.print((float)m3Throttle,3);
+    //Serial.print("\t");
+    //Serial.print((float)m4Throttle,3);
+
+    float    period = millis() - startTime;
+    Serial.print("Total time : "); Serial.print(period);
+    
+    // ensure each loop is at least 30ms
+    while(millis() - startTime < 30){
+      delayMicroseconds(100);
+    }
+    period = millis() - startTime;
+    Serial.print("Total time after: "); Serial.println(period);
   
 }
 
