@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
+// Needs more comments, hard to follow
 public class FrontPage extends AppCompatActivity {
 
     private static final String _deviceName = "QUAD";
